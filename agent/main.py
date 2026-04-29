@@ -38,10 +38,7 @@ logger = logging.getLogger("mykare-agent")
 
 
 class MayaAgent(Agent):
-    """
-    Healthcare front-desk voice agent.
-    Instance state (session_id, user_id, transcript) persists across tool calls.
-    """
+    """Healthcare front-desk voice agent."""
 
     def __init__(self, session_id: str, room: rtc.Room):
         super().__init__(instructions=SYSTEM_PROMPT)
@@ -55,7 +52,10 @@ class MayaAgent(Agent):
     def _pending(self, tool: str, display: str) -> None:
         _publish_data(self.room, {"type": "tool_call", "tool": tool, "status": "pending", "display": display})
 
-    # ── Tools ─────────────────────────────────────────────────────────────────
+    def _done(self, tool: str, display: str) -> None:
+        _publish_data(self.room, {"type": "tool_call", "tool": tool, "status": "done", "display": display})
+
+    # ── Tools ──────────────────────────────────────────────────────────────────
 
     @function_tool
     async def identify_user(self, _context: RunContext, phone: str) -> str:
@@ -65,69 +65,105 @@ class MayaAgent(Agent):
         self._user_id = result["user_id"]
         db = await get_db()
         await queries.link_session_user(db, self.session_id, self._user_id)
+        self._done("identify_user", "Account found ✓")
         return json.dumps(result)
 
     @function_tool
-    async def set_user_name(self, _context: RunContext, user_id: int, name: str) -> str:
+    async def set_user_name(self, _context: RunContext, name: str) -> str:
         """Save the user's name once you learn it from the conversation."""
         self._pending("set_user_name", "Saving name…")
-        return json.dumps(await tool_fns.set_user_name(user_id, name))
+        if not self._user_id:
+            return json.dumps({"success": False, "reason": "identify_user must be called first."})
+        result = await tool_fns.set_user_name(self._user_id, name)
+        self._done("set_user_name", "Name saved ✓")
+        return json.dumps(result)
 
     @function_tool
     async def fetch_slots(self, _context: RunContext, date: str) -> str:
         """Get available appointment slots for a given date in YYYY-MM-DD format."""
         self._pending("fetch_slots", "Fetching available slots…")
-        return json.dumps(await tool_fns.fetch_slots(date))
+        result = await tool_fns.fetch_slots(date)
+        self._done("fetch_slots", f"{result.get('count', 0)} slots available")
+        return json.dumps(result)
 
     @function_tool
-    async def book_appointment(
-        self, _context: RunContext, user_id: int, date: str, time_slot: str
-    ) -> str:
+    async def book_appointment(self, _context: RunContext, date: str, time_slot: str) -> str:
         """Book an appointment. Confirm date and time with the user before calling this."""
         self._pending("book_appointment", "Booking appointment…")
-        return json.dumps(await tool_fns.book_appointment(user_id, date, time_slot))
+        if not self._user_id:
+            return json.dumps({"success": False, "reason": "identify_user must be called first."})
+        result = await tool_fns.book_appointment(self._user_id, date, time_slot)
+        if result.get("success"):
+            self._done("book_appointment", f"Booking confirmed ✅ — {date} at {time_slot}")
+        else:
+            self._done("book_appointment", f"Booking failed: {result.get('reason', 'unknown error')}")
+        return json.dumps(result)
 
     @function_tool
-    async def retrieve_appointments(self, _context: RunContext, user_id: int) -> str:
-        """Get all confirmed appointments for a user."""
+    async def retrieve_appointments(self, _context: RunContext) -> str:
+        """Get all confirmed appointments for the current user."""
         self._pending("retrieve_appointments", "Loading appointments…")
-        return json.dumps(await tool_fns.retrieve_appointments(user_id))
+        if not self._user_id:
+            return json.dumps({"success": False, "reason": "identify_user must be called first."})
+        result = await tool_fns.retrieve_appointments(self._user_id)
+        self._done("retrieve_appointments", f"{result.get('count', 0)} appointment(s) found")
+        return json.dumps(result)
 
     @function_tool
-    async def cancel_appointment(
-        self, _context: RunContext, user_id: int, appointment_id: int
-    ) -> str:
+    async def cancel_appointment(self, _context: RunContext, appointment_id: int) -> str:
         """Cancel a specific appointment by its ID."""
         self._pending("cancel_appointment", "Cancelling appointment…")
-        return json.dumps(await tool_fns.cancel_appointment(user_id, appointment_id))
+        if not self._user_id:
+            return json.dumps({"success": False, "reason": "identify_user must be called first."})
+        result = await tool_fns.cancel_appointment(self._user_id, appointment_id)
+        if result.get("success"):
+            self._done("cancel_appointment", "Appointment cancelled ✓")
+        else:
+            self._done("cancel_appointment", f"Cancellation failed: {result.get('reason', '')}")
+        return json.dumps(result)
 
     @function_tool
     async def modify_appointment(
         self,
         _context: RunContext,
-        user_id: int,
         appointment_id: int,
         new_date: str,
         new_time: str,
     ) -> str:
         """Change an existing appointment to a new date and time slot."""
         self._pending("modify_appointment", "Updating appointment…")
-        return json.dumps(
-            await tool_fns.modify_appointment(user_id, appointment_id, new_date, new_time)
-        )
+        if not self._user_id:
+            return json.dumps({"success": False, "reason": "identify_user must be called first."})
+        result = await tool_fns.modify_appointment(self._user_id, appointment_id, new_date, new_time)
+        if result.get("success"):
+            self._done("modify_appointment", f"Rescheduled to {new_date} at {new_time} ✅")
+        else:
+            self._done("modify_appointment", f"Modification failed: {result.get('reason', '')}")
+        return json.dumps(result)
 
     @function_tool
     async def end_conversation(self, _context: RunContext) -> str:
         """End the call, generate a summary, and close the session."""
         self._pending("end_conversation", "Generating summary…")
-        result = await tool_fns.end_conversation(
-            self.session_id, self._user_id, self.transcript
+        self._finalized = True  # prevent _finalize from double-running
+
+        summary = await tool_fns.generate_summary(self.transcript)
+        db = await get_db()
+        await queries.save_session_summary(
+            db,
+            session_id=self.session_id,
+            transcript=json.dumps(self.transcript),
+            summary=json.dumps(summary),
+            cost_breakdown=json.dumps(self.cost.to_dict()),
         )
+
+        self._done("end_conversation", "Summary ready 📋")
+        # Notify frontend AFTER summary is safely in DB
         _publish_data(self.room, {"type": "summary_ready", "session_id": self.session_id})
-        return json.dumps({"status": "done", "summary": result.get("summary")})
+        return json.dumps({"status": "done"})
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 async def entrypoint(ctx: JobContext):
     await init_db()
@@ -145,39 +181,31 @@ async def entrypoint(ctx: JobContext):
         llm=lk_openai.LLM(model="gpt-4o-2024-11-20"),
         tts=cartesia.TTS(),
         vad=silero.VAD.load(),
-        # How long to wait after user stops speaking before responding.
-        # Default is ~0.5s; 0.3s feels more natural on voice calls.
         min_endpointing_delay=0.3,
         max_endpointing_delay=0.6,
     )
 
-    # ── Transcript collection ─────────────────────────────────────────────────
+    # ── Transcript collection ──────────────────────────────────────────────────
     @session.on("conversation_item_added")
     def on_item_added(event: ConversationItemAddedEvent):
         item = event.item
-        if hasattr(item, "role") and hasattr(item, "text_content"):
-            agent.transcript.append({
-                "role": item.role,
-                "content": item.text_content,  # property, not method
-                "ts": _now(),
-            })
+        role = getattr(item, "role", None)
+        if role not in ("user", "assistant"):
+            return
+        content = getattr(item, "text_content", None)
+        if content:
+            agent.transcript.append({"role": role, "content": content, "ts": _now()})
 
-    # ── Tool call status → DataChannel → frontend ─────────────────────────────
+    # ── Tool call "done" → DataChannel → frontend ──────────────────────────────
+    # NOTE: _pending() is called inside each tool method for immediate feedback.
+    # _done() is also called inside each tool method for accurate result messages.
+    # The function_tools_executed event is a fallback for any tools that miss it.
     @session.on("function_tools_executed")
     def on_tools_executed(event: FunctionToolsExecutedEvent):
-        for call, _output in event.zipped():
-            _publish_data(ctx.room, {
-                "type": "tool_call",
-                "tool": call.name,
-                "status": "done",
-                "display": _tool_display(call.name),
-            })
+        pass  # done signals are sent directly from each tool method above
 
     await session.start(agent=agent, room=ctx.room)
 
-    # Wait for the frontend participant to join, then give the browser a moment
-    # to unlock audio (room.startAudio / el.play) before sending the greeting.
-    # Without the delay the greeting audio arrives before autoplay is unblocked.
     await ctx.wait_for_participant()
     await asyncio.sleep(1.5)
     await session.say("Hello! I'm Maya, your Mykare healthcare assistant. How can I help you today?")
@@ -187,43 +215,47 @@ async def entrypoint(ctx: JobContext):
 
 
 async def _finalize(agent: MayaAgent) -> None:
-    if agent._finalized:
-        return
-    agent._finalized = True
-
+    """Called when the session ends. Saves summary + notifies frontend."""
     db = await get_db()
-    summary_result = await tool_fns.end_conversation(
-        agent.session_id, agent._user_id, agent.transcript
-    )
+
+    if agent._finalized:
+        # end_conversation tool already saved the summary.
+        # Just update the cost breakdown (it was $0 when tool ran).
+        await queries.update_cost_breakdown(db, agent.session_id, json.dumps(agent.cost.to_dict()))
+        logger.info(f"Session {agent.session_id} cost updated: {agent.cost.to_dict()['total_usd']} USD")
+        return
+
+    agent._finalized = True
+    logger.info(f"Generating summary for {agent.session_id} (agent did not call end_conversation)")
+
+    summary = await tool_fns.generate_summary(agent.transcript)
     await queries.save_session_summary(
         db,
         session_id=agent.session_id,
         transcript=json.dumps(agent.transcript),
-        summary=json.dumps(summary_result.get("summary", {})),
+        summary=json.dumps(summary),
         cost_breakdown=json.dumps(agent.cost.to_dict()),
     )
+    # This is the primary path where summary_ready fires when user just hangs up.
+    _publish_data(agent.room, {"type": "summary_ready", "session_id": agent.session_id})
     logger.info(f"Session {agent.session_id} saved. Cost: {agent.cost.to_dict()['total_usd']} USD")
 
 
 def _publish_data(room: rtc.Room, payload: dict) -> None:
-    asyncio.ensure_future(
-        room.local_participant.publish_data(
-            json.dumps(payload).encode(), reliable=True
-        )
-    )
+    async def _send():
+        try:
+            await room.local_participant.publish_data(
+                json.dumps(payload).encode(), reliable=True
+            )
+        except Exception as e:
+            logger.warning(f"publish_data failed ({payload.get('type')}): {e}")
 
-
-def _tool_display(tool_name: str) -> str:
-    return {
-        "identify_user":         "Account found",
-        "set_user_name":         "Name saved",
-        "fetch_slots":           "Slots loaded",
-        "book_appointment":      "Booking confirmed ✅",
-        "retrieve_appointments": "Appointments loaded",
-        "cancel_appointment":    "Appointment cancelled",
-        "modify_appointment":    "Appointment updated ✅",
-        "end_conversation":      "Summary ready",
-    }.get(tool_name, tool_name)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(_send())
+    except Exception as e:
+        logger.warning(f"_publish_data scheduling failed: {e}")
 
 
 def _now() -> str:

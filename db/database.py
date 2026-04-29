@@ -41,6 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_appt_date_status
 CREATE TABLE IF NOT EXISTS call_sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      TEXT    UNIQUE NOT NULL,
+    tavus_conversation_id TEXT UNIQUE,
     user_id         INTEGER REFERENCES users(id),
     transcript      TEXT,
     summary         TEXT,
@@ -69,7 +70,19 @@ async def get_db() -> aiosqlite.Connection:
 async def init_db() -> None:
     db = await get_db()
     await db.executescript(_SCHEMA)
+    await _migrate(db)
     await db.commit()
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    async with db.execute("PRAGMA table_info(call_sessions)") as cur:
+        columns = {row["name"] for row in await cur.fetchall()}
+    if "tavus_conversation_id" not in columns:
+        await db.execute("ALTER TABLE call_sessions ADD COLUMN tavus_conversation_id TEXT")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_tavus_conversation "
+            "ON call_sessions(tavus_conversation_id)"
+        )
 
 
 async def close_db() -> None:

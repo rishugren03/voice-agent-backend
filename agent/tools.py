@@ -5,13 +5,13 @@ All DB access goes through db/queries.py — no SQL here.
 """
 import json
 import datetime
-from typing import Optional
+import os
+import re
 
 from openai import AsyncOpenAI
 
 from db.database import get_db
 from db import queries
-from agent.prompts import SYSTEM_PROMPT
 
 
 async def identify_user(phone: str) -> dict:
@@ -86,22 +86,46 @@ async def modify_appointment(
     }
 
 
-async def end_conversation(session_id: str, user_id: Optional[int], transcript: list[dict]) -> dict:
+async def generate_summary(transcript: list[dict]) -> dict:
     """
-    Generate a structured call summary via GPT-4o and persist the session.
-    transcript is a list of {role, content} dicts from the conversation.
+    Generate a structured call summary via GPT-4o.
+    Returns the summary dict — DB saving is the caller's responsibility.
     """
-    client = AsyncOpenAI()
+    # If transcript is empty, return a minimal summary without calling GPT
+    if not transcript:
+        return {
+            "overview": "No conversation recorded.",
+            "appointments": [],
+            "extracted": {"name": None, "phone": None, "intent": None},
+            "preferences": None,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        }
 
+    if not os.getenv("OPENAI_API_KEY"):
+        text = " ".join(str(t.get("content", "")) for t in transcript)
+        return {
+            "overview": text[:220] or "Conversation completed.",
+            "appointments": [],
+            "extracted": {
+                "name": None,
+                "phone": _extract_phone(text),
+                "intent": _extract_intent(text),
+            },
+            "preferences": None,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+
+    client = AsyncOpenAI()
     summary_prompt = [
         {
             "role": "system",
             "content": (
-                "You are a medical receptionist summarising a call. "
-                "Return ONLY valid JSON matching this schema:\n"
-                '{"overview": str, "appointments": [{"action": str, "date": str, "time": str, "doctor": str}], '
-                '"extracted": {"name": str|null, "phone": str|null, "intent": str}, '
-                '"preferences": str|null}'
+                "You are a medical receptionist summarising a voice call. "
+                "Return ONLY valid JSON matching exactly this schema:\n"
+                '{"overview": "string", '
+                '"appointments": [{"action": "booked|cancelled|modified", "date": "string", "time": "string", "doctor": "string"}], '
+                '"extracted": {"name": "string or null", "phone": "string or null", "intent": "string"}, '
+                '"preferences": "string or null"}'
             ),
         },
         {
@@ -117,20 +141,52 @@ async def end_conversation(session_id: str, user_id: Optional[int], transcript: 
         max_tokens=512,
     )
 
-    summary_text = response.choices[0].message.content
-    summary = json.loads(summary_text)
+    summary = json.loads(response.choices[0].message.content)
     summary["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
+    return summary
 
+
+async def end_conversation(
+    session_id: str,
+    user_id: int | None,
+    transcript: list[dict],
+    cost_breakdown: dict | None = None,
+) -> dict:
+    """Generate and persist the final summary for a call session."""
     db = await get_db()
+    summary = await generate_summary(transcript)
     await queries.save_session_summary(
         db,
         session_id=session_id,
         transcript=json.dumps(transcript),
         summary=json.dumps(summary),
-        cost_breakdown=json.dumps({}),  # will be filled by agent after call ends
+        cost_breakdown=json.dumps(cost_breakdown or _zero_cost()),
     )
-
+    if user_id:
+        await queries.link_session_user(db, session_id, user_id)
     return {"summary": summary}
+
+
+def _zero_cost() -> dict:
+    return {"stt_usd": 0, "tts_usd": 0, "llm_usd": 0, "total_usd": 0}
+
+
+def _extract_phone(text: str) -> str | None:
+    match = re.search(r"(?<!\d)(?:\+?91[-\s]?)?([6-9]\d{9})(?!\d)", text)
+    return match.group(1) if match else None
+
+
+def _extract_intent(text: str) -> str | None:
+    lowered = text.lower()
+    if "cancel" in lowered:
+        return "cancel_appointment"
+    if "reschedule" in lowered or "modify" in lowered or "change" in lowered:
+        return "modify_appointment"
+    if "book" in lowered or "schedule" in lowered:
+        return "book_appointment"
+    if "appointment" in lowered and ("show" in lowered or "view" in lowered or "have" in lowered):
+        return "retrieve_appointments"
+    return None
 
 
 # ── GPT-4o function schemas ───────────────────────────────────────────────────
@@ -281,5 +337,6 @@ TOOL_REGISTRY = {
     "retrieve_appointments": retrieve_appointments,
     "cancel_appointment": cancel_appointment,
     "modify_appointment": modify_appointment,
+    "generate_summary": generate_summary,
     "end_conversation": end_conversation,
 }

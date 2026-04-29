@@ -163,6 +163,7 @@ async def create_session(db: aiosqlite.Connection, session_id: str) -> CallSessi
         """
         INSERT INTO call_sessions (session_id)
         VALUES (?)
+        ON CONFLICT(session_id) DO UPDATE SET session_id = excluded.session_id
         RETURNING id, session_id, user_id, transcript, summary, cost_breakdown, started_at, ended_at
         """,
         [session_id],
@@ -172,12 +173,38 @@ async def create_session(db: aiosqlite.Connection, session_id: str) -> CallSessi
     return CallSession(**dict(row))
 
 
+async def list_sessions(
+    db: aiosqlite.Connection, limit: int = 25
+) -> list[CallSession]:
+    async with db.execute(
+        """
+        SELECT id, session_id, user_id, transcript, summary, cost_breakdown, started_at, ended_at
+        FROM call_sessions
+        ORDER BY started_at DESC, id DESC
+        LIMIT ?
+        """,
+        [limit],
+    ) as cur:
+        rows = await cur.fetchall()
+    return [CallSession(**dict(r)) for r in rows]
+
+
 async def link_session_user(
     db: aiosqlite.Connection, session_id: str, user_id: int
 ) -> None:
     await db.execute(
         "UPDATE call_sessions SET user_id = ? WHERE session_id = ?",
         [user_id, session_id],
+    )
+    await db.commit()
+
+
+async def link_session_tavus_conversation(
+    db: aiosqlite.Connection, session_id: str, conversation_id: str
+) -> None:
+    await db.execute(
+        "UPDATE call_sessions SET tavus_conversation_id = ? WHERE session_id = ?",
+        [conversation_id, session_id],
     )
     await db.commit()
 
@@ -212,3 +239,28 @@ async def get_session(
     ) as cur:
         row = await cur.fetchone()
     return CallSession(**dict(row)) if row else None
+
+
+async def get_session_by_tavus_conversation(
+    db: aiosqlite.Connection, conversation_id: str
+) -> Optional[CallSession]:
+    async with db.execute(
+        """
+        SELECT id, session_id, user_id, transcript, summary, cost_breakdown, started_at, ended_at
+        FROM call_sessions WHERE tavus_conversation_id = ?
+        """,
+        [conversation_id],
+    ) as cur:
+        row = await cur.fetchone()
+    return CallSession(**dict(row)) if row else None
+
+
+async def update_cost_breakdown(
+    db: aiosqlite.Connection, session_id: str, cost_breakdown: str
+) -> None:
+    """Update only the cost_breakdown field — used when summary was already saved by end_conversation tool."""
+    await db.execute(
+        "UPDATE call_sessions SET cost_breakdown = ? WHERE session_id = ?",
+        [cost_breakdown, session_id],
+    )
+    await db.commit()

@@ -3,6 +3,8 @@ import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from livekit.api import AccessToken, VideoGrants
+from db.database import get_db
+from db import queries
 
 router = APIRouter()
 
@@ -30,6 +32,9 @@ async def create_token(req: TokenRequest):
     }.items() if not v]
     if missing:
         raise HTTPException(status_code=500, detail=f"Missing env vars: {missing}")
+
+    db = await get_db()
+    await queries.create_session(db, req.room)
 
     token = (
         AccessToken(api_key, api_secret)
