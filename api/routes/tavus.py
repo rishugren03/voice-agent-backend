@@ -54,16 +54,13 @@ async def create_tavus_conversation(session_id: str):
         "replica_id": replica_id,
         "persona_id": persona_id,
         "conversation_name": f"mykare-{session_id}",
+        "custom_greeting": " ",
         "conversational_context": (
             "You are Maya, a friendly healthcare front-desk assistant for Mykare. "
             "You help patients book, cancel, and modify doctor appointments. "
             "Be warm, clear, and concise. Always identify the patient by phone "
             "before appointment actions. Use tools for slot lookup, booking, "
             "retrieval, cancellation, modification, and ending the conversation."
-        ),
-        "custom_greeting": (
-            "Hello! I'm Maya, your Mykare healthcare assistant. "
-            "How can I help you today?"
         ),
         "properties": {
             "max_call_duration": 3600,
