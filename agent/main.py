@@ -21,10 +21,8 @@ from livekit.agents import (
     cli,
     function_tool,
 )
-from livekit.agents.voice.events import (
-    ConversationItemAddedEvent,
-    FunctionToolsExecutedEvent,
-)
+from livekit.agents.metrics import LLMMetrics, STTMetrics, TTSMetrics
+from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.plugins import deepgram, cartesia, silero
 from livekit.plugins import openai as lk_openai
 
@@ -185,6 +183,17 @@ async def entrypoint(ctx: JobContext):
         max_endpointing_delay=0.6,
     )
 
+    # ── Cost tracking ──────────────────────────────────────────────────────────
+    @session.on("metrics_collected")
+    def on_metrics(ev):
+        m = ev.metrics
+        if isinstance(m, LLMMetrics):
+            agent.cost.add_llm_usage(m.prompt_tokens, m.completion_tokens)
+        elif isinstance(m, STTMetrics):
+            agent.cost.add_stt_seconds(m.audio_duration)
+        elif isinstance(m, TTSMetrics):
+            agent.cost.add_tts_chars(m.characters_count)
+
     # ── Transcript collection ──────────────────────────────────────────────────
     @session.on("conversation_item_added")
     def on_item_added(event: ConversationItemAddedEvent):
@@ -195,14 +204,6 @@ async def entrypoint(ctx: JobContext):
         content = getattr(item, "text_content", None)
         if content:
             agent.transcript.append({"role": role, "content": content, "ts": _now()})
-
-    # ── Tool call "done" → DataChannel → frontend ──────────────────────────────
-    # NOTE: _pending() is called inside each tool method for immediate feedback.
-    # _done() is also called inside each tool method for accurate result messages.
-    # The function_tools_executed event is a fallback for any tools that miss it.
-    @session.on("function_tools_executed")
-    def on_tools_executed(event: FunctionToolsExecutedEvent):
-        pass  # done signals are sent directly from each tool method above
 
     await session.start(agent=agent, room=ctx.room)
 
@@ -251,10 +252,9 @@ def _publish_data(room: rtc.Room, payload: dict) -> None:
             logger.warning(f"publish_data failed ({payload.get('type')}): {e}")
 
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(_send())
-    except Exception as e:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_send())
+    except RuntimeError as e:
         logger.warning(f"_publish_data scheduling failed: {e}")
 
 
