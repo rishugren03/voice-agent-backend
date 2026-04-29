@@ -37,3 +37,5 @@ class CallSession:
     cost_breakdown: Optional[str]  # JSON string: {stt_usd, tts_usd, llm_usd}
     started_at: str
     ended_at: Optional[str]
+    user_phone: Optional[str] = None
+    user_name: Optional[str] = None

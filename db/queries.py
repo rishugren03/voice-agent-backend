@@ -178,9 +178,12 @@ async def list_sessions(
 ) -> list[CallSession]:
     async with db.execute(
         """
-        SELECT id, session_id, user_id, transcript, summary, cost_breakdown, started_at, ended_at
-        FROM call_sessions
-        ORDER BY started_at DESC, id DESC
+        SELECT 
+            cs.id, cs.session_id, cs.user_id, cs.transcript, cs.summary, cs.cost_breakdown, 
+            cs.started_at, cs.ended_at, u.phone AS user_phone, u.name AS user_name
+        FROM call_sessions cs
+        LEFT JOIN users u ON cs.user_id = u.id
+        ORDER BY cs.started_at DESC, cs.id DESC
         LIMIT ?
         """,
         [limit],
@@ -264,3 +267,30 @@ async def update_cost_breakdown(
         [cost_breakdown, session_id],
     )
     await db.commit()
+
+
+async def get_dashboard_stats(db: aiosqlite.Connection) -> dict:
+    async with db.execute(
+        """
+        SELECT 
+            (SELECT COUNT(*) FROM call_sessions) as total_interactions,
+            (SELECT COUNT(*) FROM call_sessions WHERE ended_at IS NOT NULL) as completed_sessions,
+            (SELECT COUNT(DISTINCT id) FROM users) as total_leads,
+            (SELECT AVG(strftime('%s', ended_at) - strftime('%s', started_at)) 
+             FROM call_sessions WHERE ended_at IS NOT NULL) as avg_duration,
+            (SELECT COUNT(*) FROM call_sessions WHERE started_at > datetime('now', '-1 day')) as last_24h
+        """
+    ) as cur:
+        row = await cur.fetchone()
+    
+    total = row["total_interactions"] or 0
+    completed = row["completed_sessions"] or 0
+    completion_rate = (completed * 100.0 / total) if total > 0 else 0
+    
+    return {
+        "total_interactions": total,
+        "completion_rate": completion_rate,
+        "total_leads": row["total_leads"] or 0,
+        "avg_duration_seconds": row["avg_duration"] or 0,
+        "last_24h_interactions": row["last_24h"] or 0
+    }

@@ -145,6 +145,8 @@ async def list_sessions(limit: int = 25):
                 "cost_breakdown": _json_or_none(session.cost_breakdown),
                 "started_at": session.started_at,
                 "ended_at": session.ended_at,
+                "user_phone": session.user_phone,
+                "user_name": session.user_name,
             }
             for session in sessions
         ]

@@ -9,6 +9,7 @@ from db.database import init_db, close_db
 from api.routes.token import router as token_router
 from api.routes.session import router as session_router
 from api.routes.tavus import router as tavus_router
+from api.routes.analytics import router as analytics_router
 
 
 @asynccontextmanager
@@ -30,6 +31,7 @@ app.add_middleware(
 app.include_router(token_router, prefix="/api")
 app.include_router(session_router, prefix="/api")
 app.include_router(tavus_router, prefix="/api")
+app.include_router(analytics_router, prefix="/api/analytics")
 
 
 @app.get("/health")
