@@ -160,15 +160,53 @@ async def end_conversation(
         session_id=session_id,
         transcript=json.dumps(transcript),
         summary=json.dumps(summary),
-        cost_breakdown=json.dumps(cost_breakdown or _zero_cost()),
+        cost_breakdown=json.dumps(cost_breakdown or _estimate_cost_from_transcript(transcript)),
     )
     if user_id:
         await queries.link_session_user(db, session_id, user_id)
     return {"summary": summary}
 
 
-def _zero_cost() -> dict:
-    return {"stt_usd": 0, "tts_usd": 0, "llm_usd": 0, "total_usd": 0}
+# Pricing constants (same as CostTracker)
+_DEEPGRAM_PER_MINUTE = 0.0043      # Nova-2 streaming
+_CARTESIA_PER_CHAR   = 0.000015    # Sonic
+_GPT4O_INPUT_PER_TOKEN  = 2.50 / 1_000_000
+_GPT4O_OUTPUT_PER_TOKEN = 10.00 / 1_000_000
+
+
+def _estimate_cost_from_transcript(transcript: list[dict]) -> dict:
+    """
+    Estimate STT/TTS/LLM costs from transcript text when real usage data
+    isn't available (e.g. Tavus CVI manages the voice pipeline internally).
+
+    STT  — user speech chars → words (÷5) → minutes (÷150) → Deepgram rate
+    TTS  — assistant chars × Cartesia per-char rate
+    LLM  — total chars ÷ 4 ≈ tokens, split 80/20 prompt/completion
+    """
+    user_chars      = sum(len(t.get("content", "")) for t in transcript if t.get("role") == "user")
+    assistant_chars = sum(len(t.get("content", "")) for t in transcript if t.get("role") == "assistant")
+    total_chars     = user_chars + assistant_chars
+
+    stt_minutes     = (user_chars / 5) / 150          # chars → words → minutes
+    total_tokens    = total_chars / 4                  # rough chars-to-tokens
+    prompt_tokens   = total_tokens * 0.8
+    completion_tokens = total_tokens * 0.2
+
+    stt_usd = round(stt_minutes * _DEEPGRAM_PER_MINUTE,   5)
+    tts_usd = round(assistant_chars * _CARTESIA_PER_CHAR,  5)
+    llm_usd = round(
+        prompt_tokens * _GPT4O_INPUT_PER_TOKEN
+        + completion_tokens * _GPT4O_OUTPUT_PER_TOKEN,
+        5,
+    )
+
+    return {
+        "stt_usd":   stt_usd,
+        "tts_usd":   tts_usd,
+        "llm_usd":   llm_usd,
+        "total_usd": round(stt_usd + tts_usd + llm_usd, 5),
+        "estimated": True,   # flag so UI can show "~" if desired
+    }
 
 
 def _extract_phone(text: str) -> str | None:
